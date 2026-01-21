@@ -107,6 +107,86 @@ export class RouterDO {
     });
   }
 
+  async handleSendNotification(body) {
+    const { sessionId, chatId, text, replyMarkup } = body;
+
+    if (!sessionId || !chatId || !text) {
+      return new Response(JSON.stringify({ error: 'sessionId, chatId, and text required' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Get session to verify it exists
+    const session = this.sql.exec(
+      `SELECT * FROM sessions WHERE session_id = ?`, sessionId
+    ).toArray()[0];
+
+    if (!session) {
+      return new Response(JSON.stringify({ error: 'Session not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Generate token for this notification
+    const token = this.generateToken();
+
+    // Send to Telegram
+    const telegramResponse = await fetch(
+      `https://api.telegram.org/bot${this.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: text,
+          parse_mode: 'Markdown',
+          reply_markup: replyMarkup || undefined
+        })
+      }
+    );
+
+    const telegramResult = await telegramResponse.json();
+
+    if (!telegramResult.ok) {
+      console.error('Telegram error:', telegramResult);
+      return new Response(JSON.stringify({ error: 'Telegram API error', details: telegramResult }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const messageId = telegramResult.result.message_id;
+
+    // Store message → session mapping for reply routing
+    const now = Date.now();
+    this.sql.exec(`
+      INSERT INTO messages (chat_id, message_id, session_id, token, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `, chatId, messageId, sessionId, token, now);
+
+    console.log(`Notification sent: msg ${messageId} → session ${sessionId}`);
+
+    return new Response(JSON.stringify({
+      ok: true,
+      messageId,
+      token
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  generateToken() {
+    const bytes = new Uint8Array(12);
+    crypto.getRandomValues(bytes);
+    return btoa(String.fromCharCode(...bytes))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
+  }
+
   async fetch(request) {
     await this.initialize();
 
@@ -131,6 +211,12 @@ export class RouterDO {
         return new Response(JSON.stringify(rows), {
           headers: { 'Content-Type': 'application/json' }
         });
+      }
+
+      // Notification sending (proxied through Worker)
+      if (path === '/notifications/send' && request.method === 'POST') {
+        const body = await request.json();
+        return this.handleSendNotification(body);
       }
 
       return new Response('Not found', { status: 404 });
