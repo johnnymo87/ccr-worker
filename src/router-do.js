@@ -368,6 +368,120 @@ export class RouterDO {
     return new Response('ok', { status: 200 });
   }
 
+  async handleWebSocket(request) {
+    const url = new URL(request.url);
+    const machineId = url.searchParams.get('machineId');
+
+    if (!machineId) {
+      return new Response('machineId required', { status: 400 });
+    }
+
+    // Accept WebSocket upgrade
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    // Store connection
+    this.machines.set(machineId, server);
+
+    server.accept();
+
+    console.log(`Machine connected: ${machineId}`);
+
+    // Send queued commands
+    this.flushCommandQueue(machineId, server);
+
+    server.addEventListener('message', async (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        await this.handleMachineMessage(machineId, msg);
+      } catch (err) {
+        console.error('Error handling machine message:', err);
+      }
+    });
+
+    server.addEventListener('close', () => {
+      console.log(`Machine disconnected: ${machineId}`);
+      this.machines.delete(machineId);
+    });
+
+    server.addEventListener('error', (err) => {
+      console.error(`WebSocket error for ${machineId}:`, err);
+      this.machines.delete(machineId);
+    });
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client
+    });
+  }
+
+  async flushCommandQueue(machineId, ws) {
+    const commands = this.sql.exec(`
+      SELECT id, session_id, command, chat_id
+      FROM command_queue
+      WHERE machine_id = ?
+      ORDER BY created_at ASC
+    `, machineId).toArray();
+
+    if (commands.length === 0) return;
+
+    console.log(`Flushing ${commands.length} queued commands to ${machineId}`);
+
+    for (const cmd of commands) {
+      ws.send(JSON.stringify({
+        type: 'command',
+        sessionId: cmd.session_id,
+        command: cmd.command,
+        chatId: cmd.chat_id
+      }));
+
+      // Delete from queue
+      this.sql.exec(`DELETE FROM command_queue WHERE id = ?`, cmd.id);
+    }
+  }
+
+  async handleMachineMessage(machineId, msg) {
+    // Handle messages from machine agents
+    if (msg.type === 'ping') {
+      const ws = this.machines.get(machineId);
+      if (ws) ws.send(JSON.stringify({ type: 'pong' }));
+      return;
+    }
+
+    if (msg.type === 'commandResult') {
+      // Machine reporting command execution result
+      const { sessionId, success, error, chatId } = msg;
+
+      if (!success && chatId) {
+        await this.sendTelegramMessage(chatId, `❌ Command failed: ${error}`);
+      }
+      return;
+    }
+
+    console.log(`Unknown message from ${machineId}:`, msg);
+  }
+
+  async cleanup() {
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+
+    // Clean old messages
+    const msgResult = this.sql.exec(`
+      DELETE FROM messages WHERE created_at < ?
+    `, oneDayAgo);
+
+    // Clean old queued commands (shouldn't happen if machines reconnect)
+    const queueResult = this.sql.exec(`
+      DELETE FROM command_queue WHERE created_at < ?
+    `, oneDayAgo);
+
+    // Clean stale sessions (no activity in 24h)
+    const sessionResult = this.sql.exec(`
+      DELETE FROM sessions WHERE updated_at < ?
+    `, oneDayAgo);
+
+    console.log(`Cleanup: ${msgResult.changes} messages, ${queueResult.changes} queued, ${sessionResult.changes} sessions`);
+  }
+
   async fetch(request) {
     await this.initialize();
 
@@ -375,6 +489,11 @@ export class RouterDO {
     const path = url.pathname;
 
     try {
+      // WebSocket upgrade for machine agents
+      if (path === '/ws' && request.headers.get('Upgrade') === 'websocket') {
+        return this.handleWebSocket(request);
+      }
+
       // Session management
       if (path === '/sessions/register' && request.method === 'POST') {
         const body = await request.json();
@@ -403,6 +522,14 @@ export class RouterDO {
       // Telegram webhook
       if (path.startsWith('/webhook/telegram') && request.method === 'POST') {
         return this.handleTelegramWebhook(request);
+      }
+
+      // Cleanup (call periodically via cron or manually)
+      if (path === '/cleanup' && request.method === 'POST') {
+        await this.cleanup();
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
 
       return new Response('Not found', { status: 404 });
