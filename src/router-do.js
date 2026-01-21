@@ -187,6 +187,187 @@ export class RouterDO {
       .replace(/=/g, '');
   }
 
+  verifyWebhookSecret(request) {
+    const secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+    return secret === this.env.TELEGRAM_WEBHOOK_SECRET;
+  }
+
+  async handleTelegramWebhook(request) {
+    // Verify webhook secret
+    if (!this.verifyWebhookSecret(request)) {
+      console.warn('Invalid webhook secret');
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    const update = await request.json();
+    console.log('Webhook received:', JSON.stringify(update).slice(0, 200));
+
+    // Handle message (including replies)
+    if (update.message) {
+      return this.handleTelegramMessage(update.message);
+    }
+
+    // Handle callback query (button clicks)
+    if (update.callback_query) {
+      return this.handleTelegramCallback(update.callback_query);
+    }
+
+    // Acknowledge other update types
+    return new Response('ok', { status: 200 });
+  }
+
+  async handleTelegramMessage(message) {
+    const chatId = message.chat.id;
+    const text = message.text || '';
+    const replyToMessage = message.reply_to_message;
+
+    // Try to route via reply-to-message
+    let sessionId = null;
+    let token = null;
+
+    if (replyToMessage) {
+      const mapping = this.sql.exec(`
+        SELECT session_id, token FROM messages
+        WHERE chat_id = ? AND message_id = ?
+      `, chatId, replyToMessage.message_id).toArray()[0];
+
+      if (mapping) {
+        sessionId = mapping.session_id;
+        token = mapping.token;
+      }
+    }
+
+    // If no reply-to match, try parsing /cmd TOKEN format
+    if (!sessionId) {
+      const cmdMatch = text.match(/^\/cmd\s+(\S+)\s+(.+)$/s);
+      if (cmdMatch) {
+        token = cmdMatch[1];
+        // Look up session by token
+        const mapping = this.sql.exec(`
+          SELECT session_id FROM messages WHERE token = ?
+        `, token).toArray()[0];
+        if (mapping) {
+          sessionId = mapping.session_id;
+        }
+      }
+    }
+
+    if (!sessionId) {
+      // Can't route - send error
+      await this.sendTelegramMessage(chatId,
+        '⏰ Could not find session for this message. Please reply to a recent notification or use /cmd TOKEN command format.');
+      return new Response('ok', { status: 200 });
+    }
+
+    // Get the command text
+    let command = text;
+    if (text.startsWith('/cmd')) {
+      command = text.replace(/^\/cmd\s+\S+\s+/, '');
+    }
+
+    // Route command to machine
+    return this.routeCommandToMachine(sessionId, command, chatId);
+  }
+
+  async handleTelegramCallback(callbackQuery) {
+    const chatId = callbackQuery.message?.chat.id;
+    const messageId = callbackQuery.message?.message_id;
+    const data = callbackQuery.data; // e.g., "cmd:TOKEN:continue"
+
+    // Parse callback data
+    const parts = data.split(':');
+    if (parts[0] !== 'cmd' || parts.length < 3) {
+      return new Response('ok', { status: 200 });
+    }
+
+    const token = parts[1];
+    const action = parts.slice(2).join(':');
+
+    // Look up session
+    const mapping = this.sql.exec(`
+      SELECT session_id FROM messages WHERE token = ?
+    `, token).toArray()[0];
+
+    if (!mapping) {
+      await this.answerCallbackQuery(callbackQuery.id, 'Session expired');
+      return new Response('ok', { status: 200 });
+    }
+
+    // Map action to command
+    const commandMap = {
+      'continue': '',
+      'yes': 'y',
+      'no': 'n',
+      'exit': '/exit'
+    };
+
+    const command = commandMap[action] ?? action;
+
+    // Acknowledge the button press
+    await this.answerCallbackQuery(callbackQuery.id, `Sending: ${command || '(continue)'}`);
+
+    // Route to machine
+    return this.routeCommandToMachine(mapping.session_id, command, chatId);
+  }
+
+  async sendTelegramMessage(chatId, text) {
+    await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text })
+    });
+  }
+
+  async answerCallbackQuery(callbackQueryId, text) {
+    await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text })
+    });
+  }
+
+  async routeCommandToMachine(sessionId, command, chatId) {
+    // Get machine for this session
+    const session = this.sql.exec(`
+      SELECT machine_id, label FROM sessions WHERE session_id = ?
+    `, sessionId).toArray()[0];
+
+    if (!session) {
+      await this.sendTelegramMessage(chatId, '❌ Session not found');
+      return new Response('ok', { status: 200 });
+    }
+
+    const machineId = session.machine_id;
+
+    // Check if machine is connected via WebSocket
+    const ws = this.machines.get(machineId);
+
+    if (ws && ws.readyState === 1) { // WebSocket.OPEN
+      // Send command over WebSocket
+      ws.send(JSON.stringify({
+        type: 'command',
+        sessionId,
+        command,
+        chatId
+      }));
+
+      console.log(`Command sent to ${machineId}: ${command.slice(0, 50)}`);
+      return new Response('ok', { status: 200 });
+    }
+
+    // Machine offline - queue command
+    const now = Date.now();
+    this.sql.exec(`
+      INSERT INTO command_queue (machine_id, session_id, command, chat_id, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `, machineId, sessionId, command, chatId, now);
+
+    await this.sendTelegramMessage(chatId,
+      `📥 Command queued - ${session.label || machineId} is offline. Will deliver when it reconnects.`);
+
+    return new Response('ok', { status: 200 });
+  }
+
   async fetch(request) {
     await this.initialize();
 
@@ -217,6 +398,11 @@ export class RouterDO {
       if (path === '/notifications/send' && request.method === 'POST') {
         const body = await request.json();
         return this.handleSendNotification(body);
+      }
+
+      // Telegram webhook
+      if (path.startsWith('/webhook/telegram') && request.method === 'POST') {
+        return this.handleTelegramWebhook(request);
       }
 
       return new Response('Not found', { status: 404 });
