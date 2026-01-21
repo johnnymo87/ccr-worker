@@ -57,10 +57,90 @@ export class RouterDO {
     `);
   }
 
+  async handleRegisterSession(body) {
+    const { sessionId, machineId, label } = body;
+
+    if (!sessionId || !machineId) {
+      return new Response(JSON.stringify({ error: 'sessionId and machineId required' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const now = Date.now();
+
+    this.sql.exec(`
+      INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        machine_id = excluded.machine_id,
+        label = excluded.label,
+        updated_at = excluded.updated_at
+    `, sessionId, machineId, label || null, now, now);
+
+    console.log(`Session registered: ${sessionId} → ${machineId} (${label || 'no label'})`);
+
+    return new Response(JSON.stringify({ ok: true, sessionId, machineId }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  async handleUnregisterSession(body) {
+    const { sessionId } = body;
+
+    if (!sessionId) {
+      return new Response(JSON.stringify({ error: 'sessionId required' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    this.sql.exec(`DELETE FROM sessions WHERE session_id = ?`, sessionId);
+    this.sql.exec(`DELETE FROM messages WHERE session_id = ?`, sessionId);
+
+    console.log(`Session unregistered: ${sessionId}`);
+
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
   async fetch(request) {
-    // Ensure tables exist
     await this.initialize();
 
-    return new Response('RouterDO initialized', { status: 200 });
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    try {
+      // Session management
+      if (path === '/sessions/register' && request.method === 'POST') {
+        const body = await request.json();
+        return this.handleRegisterSession(body);
+      }
+
+      if (path === '/sessions/unregister' && request.method === 'POST') {
+        const body = await request.json();
+        return this.handleUnregisterSession(body);
+      }
+
+      // List sessions (for debugging)
+      if (path === '/sessions' && request.method === 'GET') {
+        const rows = this.sql.exec(`SELECT * FROM sessions`).toArray();
+        return new Response(JSON.stringify(rows), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
+      return new Response('Not found', { status: 404 });
+
+    } catch (err) {
+      console.error('Error:', err);
+      return new Response(JSON.stringify({ error: err.message }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
   }
 }
