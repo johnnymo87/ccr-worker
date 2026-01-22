@@ -192,6 +192,15 @@ export class RouterDO {
     return secret === this.env.TELEGRAM_WEBHOOK_SECRET;
   }
 
+  verifyApiKey(request) {
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return false;
+    }
+    const token = authHeader.slice(7);
+    return token === this.env.CCR_API_KEY;
+  }
+
   async handleTelegramWebhook(request) {
     // Verify webhook secret
     if (!this.verifyWebhookSecret(request)) {
@@ -487,6 +496,24 @@ export class RouterDO {
 
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Routes that require API key authentication
+    const protectedRoutes = [
+      '/sessions/register',
+      '/sessions/unregister',
+      '/sessions',
+      '/notifications/send',
+      '/cleanup'
+    ];
+
+    const needsAuth = protectedRoutes.some(route => path === route || path.startsWith(route + '/'));
+
+    if (needsAuth && !this.verifyApiKey(request)) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
     try {
       // WebSocket upgrade for machine agents

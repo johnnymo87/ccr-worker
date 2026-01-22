@@ -12,6 +12,7 @@ tag = "v1"
 new_sqlite_classes = ["RouterDO"]
 
 [vars]
-# Set via wrangler secret
+# Set via wrangler secret:
 # TELEGRAM_WEBHOOK_SECRET = ""
 # TELEGRAM_BOT_TOKEN = ""
+# CCR_API_KEY = ""
