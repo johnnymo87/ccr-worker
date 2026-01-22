@@ -80,15 +80,26 @@ curl -X POST https://ccr-router.jonathan-mohrbacher.workers.dev/sessions/unregis
   -d '{"sessionId":"test"}'
 ```
 
-### Telegram 404 errors
+### Telegram 404 or 401 errors
 
-If notifications fail with Telegram 404, the bot token secret is invalid:
+If Worker fails with Telegram errors, secrets may be corrupted from shell escaping:
+- **404**: Bot token invalid
+- **401 Unauthorized**: Webhook secret mismatch
+
+Re-set using file input (avoids shell escaping issues):
 
 ```bash
-# Re-set using file input (avoids shell escaping issues)
-grep -o 'TELEGRAM_BOT_TOKEN=.*' ~/projects/claude-code-remote/.env | cut -d= -f2 > /tmp/token.txt
-wrangler secret put TELEGRAM_BOT_TOKEN < /tmp/token.txt
-rm /tmp/token.txt
+export CLOUDFLARE_API_TOKEN="$(cat /run/secrets/cloudflare_api_token)"
+
+# Bot token (fixes 404)
+grep -o 'TELEGRAM_BOT_TOKEN=.*' ~/projects/claude-code-remote/.env | cut -d= -f2 > /tmp/secret.txt
+wrangler secret put TELEGRAM_BOT_TOKEN < /tmp/secret.txt
+rm /tmp/secret.txt
+
+# Webhook secret (fixes 401)
+grep -o 'TELEGRAM_WEBHOOK_SECRET=.*' ~/projects/claude-code-remote/.env | cut -d= -f2 > /tmp/secret.txt
+wrangler secret put TELEGRAM_WEBHOOK_SECRET < /tmp/secret.txt
+rm /tmp/secret.txt
 ```
 
 ### View Worker logs
