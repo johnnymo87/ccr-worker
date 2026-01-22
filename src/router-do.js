@@ -192,6 +192,43 @@ export class RouterDO {
     return secret === this.env.TELEGRAM_WEBHOOK_SECRET;
   }
 
+  isAllowedTelegramSource(chatId, userId) {
+    // Parse ALLOWED_CHAT_IDS
+    const allowedChatsRaw = this.env.ALLOWED_CHAT_IDS || '';
+    const allowedChats = allowedChatsRaw
+      .split(',')
+      .map(id => id.trim())
+      .filter(id => id.length > 0);
+
+    // Fail closed: if no allowed chats configured, deny all
+    if (allowedChats.length === 0) {
+      console.warn('ALLOWED_CHAT_IDS not configured - denying all Telegram requests');
+      return false;
+    }
+
+    // Check if chatId is allowed
+    const chatIdStr = String(chatId);
+    if (!allowedChats.includes(chatIdStr)) {
+      return false;
+    }
+
+    // If ALLOWED_USER_IDS is configured, also check userId
+    const allowedUsersRaw = this.env.ALLOWED_USER_IDS || '';
+    const allowedUsers = allowedUsersRaw
+      .split(',')
+      .map(id => id.trim())
+      .filter(id => id.length > 0);
+
+    if (allowedUsers.length > 0) {
+      const userIdStr = String(userId);
+      if (!allowedUsers.includes(userIdStr)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   verifyApiKey(request) {
     const authHeader = request.headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -210,6 +247,16 @@ export class RouterDO {
 
     const update = await request.json();
     console.log('Webhook received:', JSON.stringify(update).slice(0, 200));
+
+    // Extract chatId and userId for allowlist check
+    const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
+    const userId = update.message?.from?.id || update.callback_query?.from?.id;
+
+    // Check allowlist
+    if (!this.isAllowedTelegramSource(chatId, userId)) {
+      console.warn(`Telegram request denied: chatId=${chatId}, userId=${userId}`);
+      return new Response('ok', { status: 200 });
+    }
 
     // Handle message (including replies)
     if (update.message) {

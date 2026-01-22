@@ -16,3 +16,5 @@ new_sqlite_classes = ["RouterDO"]
 # TELEGRAM_WEBHOOK_SECRET = ""
 # TELEGRAM_BOT_TOKEN = ""
 # CCR_API_KEY = ""
+# ALLOWED_CHAT_IDS = "123456789,987654321"  # comma-separated
+# ALLOWED_USER_IDS = "123456789"  # comma-separated, optional
