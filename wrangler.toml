@@ -9,7 +9,7 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["RouterDO"]
+new_sqlite_classes = ["RouterDO"]
 
 [vars]
 # Set via wrangler secret
