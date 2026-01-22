@@ -251,10 +251,10 @@ export class RouterDO {
       const cmdMatch = text.match(/^\/cmd\s+(\S+)\s+(.+)$/s);
       if (cmdMatch) {
         token = cmdMatch[1];
-        // Look up session by token
+        // Look up session by token (must match chat_id to prevent cross-chat replay)
         const mapping = this.sql.exec(`
-          SELECT session_id FROM messages WHERE token = ?
-        `, token).toArray()[0];
+          SELECT session_id FROM messages WHERE token = ? AND chat_id = ?
+        `, token, chatId).toArray()[0];
         if (mapping) {
           sessionId = mapping.session_id;
         }
@@ -292,10 +292,10 @@ export class RouterDO {
     const token = parts[1];
     const action = parts.slice(2).join(':');
 
-    // Look up session
+    // Look up session (must match chat_id to prevent cross-chat replay)
     const mapping = this.sql.exec(`
-      SELECT session_id FROM messages WHERE token = ?
-    `, token).toArray()[0];
+      SELECT session_id FROM messages WHERE token = ? AND chat_id = ?
+    `, token, chatId).toArray()[0];
 
     if (!mapping) {
       await this.answerCallbackQuery(callbackQuery.id, 'Session expired');
