@@ -164,7 +164,7 @@ export class RouterDO {
         body: JSON.stringify({
           chat_id: chatId,
           text: text,
-          parse_mode: 'Markdown',
+          // Removed parse_mode: 'Markdown' - causes 502 on unescaped special chars
           reply_markup: replyMarkup || undefined
         })
       }
