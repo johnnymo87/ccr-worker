@@ -543,15 +543,20 @@ export class RouterDO {
     console.log(`Flushing ${commands.length} queued commands to ${machineId}`);
 
     for (const cmd of commands) {
-      ws.send(JSON.stringify({
-        type: 'command',
-        sessionId: cmd.session_id,
-        command: cmd.command,
-        chatId: cmd.chat_id
-      }));
-
-      // Delete from queue
-      this.sql.exec(`DELETE FROM command_queue WHERE id = ?`, cmd.id);
+      try {
+        ws.send(JSON.stringify({
+          type: 'command',
+          id: cmd.id,  // Include queue ID for ack
+          sessionId: cmd.session_id,
+          command: cmd.command,
+          chatId: cmd.chat_id
+        }));
+        // Don't delete yet - wait for ack
+      } catch (err) {
+        // Socket write failed - stop flushing, commands stay in queue
+        console.error(`Failed to send queued command ${cmd.id} to ${machineId}:`, err.message);
+        break;
+      }
     }
   }
 
@@ -560,6 +565,16 @@ export class RouterDO {
     if (msg.type === 'ping') {
       const ws = this.machines.get(machineId);
       if (ws) ws.send(JSON.stringify({ type: 'pong' }));
+      return;
+    }
+
+    if (msg.type === 'ack') {
+      // Machine acknowledged receipt of queued command
+      const { id } = msg;
+      if (id) {
+        this.sql.exec(`DELETE FROM command_queue WHERE id = ?`, id);
+        console.log(`Command ${id} acknowledged and deleted from queue`);
+      }
       return;
     }
 
