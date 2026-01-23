@@ -674,29 +674,29 @@ export class RouterDO {
 
   async cleanup() {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
 
     // Clean old messages
-    const msgResult = this.sql.exec(`
+    const msgCursor = this.sql.exec(`
       DELETE FROM messages WHERE created_at < ?
     `, oneDayAgo);
 
     // Clean old queued commands (shouldn't happen if machines reconnect)
-    const queueResult = this.sql.exec(`
+    const queueCursor = this.sql.exec(`
       DELETE FROM command_queue WHERE created_at < ?
     `, oneDayAgo);
 
     // Clean stale sessions (no activity in 24h)
-    const sessionResult = this.sql.exec(`
+    const sessionCursor = this.sql.exec(`
       DELETE FROM sessions WHERE updated_at < ?
     `, oneDayAgo);
 
     // Clean old seen updates (keep 1 hour worth)
-    const oneHourAgo = Date.now() - 60 * 60 * 1000;
-    const seenResult = this.sql.exec(`
+    const seenCursor = this.sql.exec(`
       DELETE FROM seen_updates WHERE created_at < ?
     `, oneHourAgo);
 
-    console.log(`Cleanup: ${msgResult.changes} messages, ${queueResult.changes} queued, ${sessionResult.changes} sessions, ${seenResult.changes} seen_updates`);
+    console.log(`Cleanup: ${msgCursor.rowsWritten} messages, ${queueCursor.rowsWritten} queued, ${sessionCursor.rowsWritten} sessions, ${seenCursor.rowsWritten} seen_updates`);
   }
 
   async fetch(request) {
