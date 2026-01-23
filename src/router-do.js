@@ -235,7 +235,24 @@ export class RouterDO {
       return false;
     }
     const token = authHeader.slice(7);
-    return token === this.env.CCR_API_KEY;
+    const expected = this.env.CCR_API_KEY;
+
+    // Constant-time comparison to prevent timing attacks
+    if (!expected || token.length !== expected.length) {
+      return false;
+    }
+
+    const encoder = new TextEncoder();
+    const a = encoder.encode(token);
+    const b = encoder.encode(expected);
+
+    // crypto.subtle.timingSafeEqual is not available in Workers
+    // Use manual constant-time comparison
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+      result |= a[i] ^ b[i];
+    }
+    return result === 0;
   }
 
   async handleTelegramWebhook(request) {
