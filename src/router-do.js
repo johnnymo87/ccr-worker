@@ -38,17 +38,69 @@ export class RouterDO {
       )
     `);
 
-    // Command queue: pending commands for offline machines
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS command_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        machine_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        command TEXT NOT NULL,
-        chat_id INTEGER NOT NULL,
-        created_at INTEGER NOT NULL
-      )
-    `);
+    // Command queue migration: convert to command_id as PK with proper schema
+    const hasOldSchema = (() => {
+      try {
+        const cols = this.sql.exec(`PRAGMA table_info(command_queue)`).toArray();
+        const hasId = cols.some(c => c.name === 'id' && c.pk === 1);
+        const hasCommandIdPK = cols.some(c => c.name === 'command_id' && c.pk === 1);
+        return hasId && !hasCommandIdPK;
+      } catch {
+        return false;
+      }
+    })();
+
+    if (hasOldSchema) {
+      console.log('Migrating command_queue to new schema...');
+      // Create new table with correct schema
+      this.sql.exec(`
+        CREATE TABLE command_queue_new (
+          command_id TEXT PRIMARY KEY,
+          machine_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          command TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at INTEGER NOT NULL,
+          sent_at INTEGER,
+          acked_at INTEGER,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_retry_at INTEGER,
+          last_error TEXT
+        )
+      `);
+      // Copy existing data with generated command_id
+      this.sql.exec(`
+        INSERT INTO command_queue_new (command_id, machine_id, session_id, command, chat_id, status, created_at)
+        SELECT 'legacy-' || id, machine_id, session_id, command, CAST(chat_id AS TEXT), 'pending', created_at
+        FROM command_queue
+      `);
+      // Swap tables
+      this.sql.exec(`DROP TABLE command_queue`);
+      this.sql.exec(`ALTER TABLE command_queue_new RENAME TO command_queue`);
+      console.log('Migration complete');
+    } else {
+      // Fresh install or already migrated
+      this.sql.exec(`
+        CREATE TABLE IF NOT EXISTS command_queue (
+          command_id TEXT PRIMARY KEY,
+          machine_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          command TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at INTEGER NOT NULL,
+          sent_at INTEGER,
+          acked_at INTEGER,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_retry_at INTEGER,
+          last_error TEXT
+        )
+      `);
+    }
+
+    // Backfill any NULL status values
+    this.sql.exec(`UPDATE command_queue SET status = 'pending' WHERE status IS NULL`);
 
     // Seen updates: deduplicate Telegram webhook retries
     this.sql.exec(`
@@ -222,6 +274,12 @@ export class RouterDO {
       .replace(/\+/g, '-')
       .replace(/\//g, '_')
       .replace(/=/g, '');
+  }
+
+  generateCommandId() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
   }
 
   touchSession(sessionId) {
@@ -467,59 +525,85 @@ export class RouterDO {
       return new Response('ok', { status: 200 });
     }
 
-    // Get machine for this session
     const session = this.sql.exec(`
       SELECT machine_id, label FROM sessions WHERE session_id = ?
     `, sessionId).toArray()[0];
 
     if (!session) {
-      await this.sendTelegramMessage(chatId, '❌ Session not found');
+      await this.sendTelegramMessage(chatId, 'Session not found');
       return new Response('ok', { status: 200 });
     }
 
-    // Touch session to prevent cleanup of active sessions
     this.touchSession(sessionId);
-
     const machineId = session.machine_id;
 
-    // Check if machine is connected via WebSocket
-    const ws = this.machines.get(machineId);
-
-    if (ws && ws.readyState === 1) { // WebSocket.OPEN
-      // Send command over WebSocket
-      ws.send(JSON.stringify({
-        type: 'command',
-        sessionId,
-        command,
-        chatId
-      }));
-
-      console.log(`Command sent to ${machineId}: ${command.slice(0, 50)}`);
-      return new Response('ok', { status: 200 });
-    }
-
-    // Check queue size before adding
+    // Check queue size (exclude acked)
     const queueSize = this.sql.exec(`
-      SELECT COUNT(*) as count FROM command_queue WHERE machine_id = ?
+      SELECT COUNT(*) as count FROM command_queue WHERE machine_id = ? AND status != 'acked'
     `, machineId).toArray()[0].count;
 
     if (queueSize >= this.MAX_QUEUE_PER_MACHINE) {
       await this.sendTelegramMessage(chatId,
-        `Queue full for ${session.label || machineId} (${queueSize} commands pending). Try again later.`);
+        `Queue full for ${session.label || machineId} (${queueSize} commands pending).`);
       return new Response('ok', { status: 200 });
     }
 
-    // Machine offline - queue command
+    // Generate immutable command ID
+    const commandId = this.generateCommandId();
     const now = Date.now();
-    this.sql.exec(`
-      INSERT INTO command_queue (machine_id, session_id, command, chat_id, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `, machineId, sessionId, command, chatId, now);
 
-    await this.sendTelegramMessage(chatId,
-      `📥 Command queued - ${session.label || machineId} is offline. Will deliver when it reconnects.`);
+    // Always insert into queue first (durable) before any send attempt
+    this.sql.exec(`
+      INSERT INTO command_queue (command_id, machine_id, session_id, command, chat_id, status, created_at, next_retry_at)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+    `, commandId, machineId, sessionId, command, String(chatId), now, now);
+
+    // Try to send immediately if connected
+    const ws = this.machines.get(machineId);
+    if (ws && ws.readyState === 1) {
+      this.sendCommand(ws, commandId, sessionId, command, chatId);
+    } else {
+      await this.sendTelegramMessage(chatId,
+        `Command queued - ${session.label || machineId} is offline.`);
+    }
 
     return new Response('ok', { status: 200 });
+  }
+
+  sendCommand(ws, commandId, sessionId, command, chatId) {
+    const currentAttempts = this.getAttempts(commandId);
+    const newAttempts = currentAttempts + 1;
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'command',
+        commandId,
+        sessionId,
+        command,
+        chatId: String(chatId)
+      }));
+      // Mark as sent, increment attempts
+      this.sql.exec(`
+        UPDATE command_queue
+        SET status = 'sent', sent_at = ?, attempts = ?
+        WHERE command_id = ?
+      `, Date.now(), newAttempts, commandId);
+      console.log(`Command ${commandId} sent (attempt ${newAttempts})`);
+    } catch (err) {
+      // Mark retry with exponential backoff
+      const backoffMs = Math.min(1000 * Math.pow(2, currentAttempts), 300000); // max 5 min
+      this.sql.exec(`
+        UPDATE command_queue
+        SET attempts = ?, next_retry_at = ?, last_error = ?
+        WHERE command_id = ?
+      `, newAttempts, Date.now() + backoffMs, err.message, commandId);
+      console.error(`Failed to send command ${commandId}:`, err.message);
+    }
+  }
+
+  getAttempts(commandId) {
+    const row = this.sql.exec(`SELECT attempts FROM command_queue WHERE command_id = ?`, commandId).toArray()[0];
+    return row ? row.attempts : 0;
   }
 
   async handleWebSocket(request) {
@@ -576,8 +660,10 @@ export class RouterDO {
 
     console.log(`Machine authenticated and connected: ${machineId}`);
 
-    // Flush queued commands
-    this.flushCommandQueue(machineId, server);
+    // Flush queued commands (fire-and-forget, catch errors)
+    this.flushCommandQueue(machineId, server).catch(err => {
+      console.error(`Failed to flush queue for ${machineId}:`, err.message);
+    });
 
     server.addEventListener('message', async (event) => {
       try {
@@ -612,37 +698,30 @@ export class RouterDO {
   }
 
   async flushCommandQueue(machineId, ws) {
+    const BATCH_SIZE = 10;
+    const now = Date.now();
+
+    // Get pending/sent commands ready for (re)send, respecting backoff
     const commands = this.sql.exec(`
-      SELECT id, session_id, command, chat_id
+      SELECT command_id, session_id, command, chat_id
       FROM command_queue
       WHERE machine_id = ?
+        AND status IN ('pending', 'sent')
+        AND (next_retry_at IS NULL OR next_retry_at <= ?)
       ORDER BY created_at ASC
-    `, machineId).toArray();
+      LIMIT ?
+    `, machineId, now, BATCH_SIZE).toArray();
 
     if (commands.length === 0) return;
 
-    console.log(`Flushing ${commands.length} queued commands to ${machineId}`);
+    console.log(`Flushing ${commands.length} commands to ${machineId} (batch of ${BATCH_SIZE})`);
 
     for (const cmd of commands) {
-      try {
-        ws.send(JSON.stringify({
-          type: 'command',
-          id: cmd.id,  // Include queue ID for ack
-          sessionId: cmd.session_id,
-          command: cmd.command,
-          chatId: cmd.chat_id
-        }));
-        // Don't delete yet - wait for ack
-      } catch (err) {
-        // Socket write failed - stop flushing, commands stay in queue
-        console.error(`Failed to send queued command ${cmd.id} to ${machineId}:`, err.message);
-        break;
-      }
+      this.sendCommand(ws, cmd.command_id, cmd.session_id, cmd.command, cmd.chat_id);
     }
   }
 
   async handleMachineMessage(machineId, msg) {
-    // Handle messages from machine agents
     if (msg.type === 'ping') {
       const ws = this.machines.get(machineId);
       if (ws) ws.send(JSON.stringify({ type: 'pong' }));
@@ -650,26 +729,27 @@ export class RouterDO {
     }
 
     if (msg.type === 'ack') {
-      // Machine acknowledged receipt of queued command
-      const { id } = msg;
-      if (id) {
-        this.sql.exec(`DELETE FROM command_queue WHERE id = ?`, id);
-        console.log(`Command ${id} acknowledged and deleted from queue`);
+      const { commandId } = msg;
+      if (commandId && typeof commandId === 'string' && commandId.length <= 64) {
+        // Validate this command belongs to this machine (prevents cross-machine deletion)
+        const result = this.sql.exec(`
+          UPDATE command_queue SET status = 'acked', acked_at = ?
+          WHERE command_id = ? AND machine_id = ?
+        `, Date.now(), commandId, machineId);
+        if (result.rowsWritten > 0) {
+          console.log(`Command ${commandId} acked by ${machineId}`);
+        }
       }
       return;
     }
 
     if (msg.type === 'commandResult') {
-      // Machine reporting command execution result
-      const { sessionId, success, error, chatId } = msg;
-
+      const { success, error, chatId } = msg;
       if (!success && chatId) {
-        await this.sendTelegramMessage(chatId, `❌ Command failed: ${error}`);
+        await this.sendTelegramMessage(chatId, `Command failed: ${error}`);
       }
       return;
     }
-
-    console.log(`Unknown message from ${machineId}:`, msg);
   }
 
   async cleanup() {
@@ -681,10 +761,17 @@ export class RouterDO {
       DELETE FROM messages WHERE created_at < ?
     `, oneDayAgo);
 
-    // Clean old queued commands (shouldn't happen if machines reconnect)
-    const queueCursor = this.sql.exec(`
-      DELETE FROM command_queue WHERE created_at < ?
+    // Clean acked commands older than 1 hour (keep briefly for debugging)
+    const queueCleanup = this.sql.exec(`
+      DELETE FROM command_queue WHERE status = 'acked' AND acked_at < ?
+    `, oneHourAgo);
+    console.log(`Cleaned ${queueCleanup.rowsWritten} acked commands`);
+
+    // Clean stuck pending/sent commands older than 24h (failed delivery)
+    const stuckCleanup = this.sql.exec(`
+      DELETE FROM command_queue WHERE status != 'acked' AND created_at < ?
     `, oneDayAgo);
+    console.log(`Cleaned ${stuckCleanup.rowsWritten} stuck commands`);
 
     // Clean stale sessions (no activity in 24h)
     const sessionCursor = this.sql.exec(`
@@ -696,7 +783,7 @@ export class RouterDO {
       DELETE FROM seen_updates WHERE created_at < ?
     `, oneHourAgo);
 
-    console.log(`Cleanup: ${msgCursor.rowsWritten} messages, ${queueCursor.rowsWritten} queued, ${sessionCursor.rowsWritten} sessions, ${seenCursor.rowsWritten} seen_updates`);
+    console.log(`Cleanup: ${msgCursor.rowsWritten} messages, ${sessionCursor.rowsWritten} sessions, ${seenCursor.rowsWritten} seen_updates`);
   }
 
   async fetch(request) {
