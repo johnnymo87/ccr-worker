@@ -449,61 +449,58 @@ export class RouterDO {
       return new Response('machineId required', { status: 400 });
     }
 
-    // Accept WebSocket upgrade
+    // Check auth via Sec-WebSocket-Protocol header
+    // Client sends: Sec-WebSocket-Protocol: ccr, <api-key>
+    const protocols = request.headers.get('Sec-WebSocket-Protocol');
+    if (!protocols) {
+      return new Response('Authentication required', { status: 401 });
+    }
+
+    const parts = protocols.split(',').map(p => p.trim());
+    if (parts[0] !== 'ccr' || parts.length < 2) {
+      return new Response('Invalid protocol', { status: 401 });
+    }
+
+    const apiKey = parts[1];
+    const expected = this.env.CCR_API_KEY;
+
+    // Constant-time comparison
+    if (!expected || apiKey.length !== expected.length) {
+      return new Response('Invalid API key', { status: 401 });
+    }
+
+    const encoder = new TextEncoder();
+    const a = encoder.encode(apiKey);
+    const b = encoder.encode(expected);
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+      result |= a[i] ^ b[i];
+    }
+    if (result !== 0) {
+      return new Response('Invalid API key', { status: 401 });
+    }
+
+    // Auth passed - accept WebSocket
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
+    // Close existing connection for this machine
+    const existing = this.machines.get(machineId);
+    if (existing && existing !== server) {
+      existing.close(4000, 'Replaced by new connection');
+    }
+
+    this.machines.set(machineId, server);
     server.accept();
 
-    let authenticated = false;
+    console.log(`Machine authenticated and connected: ${machineId}`);
 
-    // Set up 10-second auth timeout
-    const authTimeout = setTimeout(() => {
-      if (!authenticated) {
-        console.warn(`Auth timeout for ${machineId}`);
-        server.close(4001, 'Auth timeout');
-      }
-    }, 10000);
+    // Flush queued commands
+    this.flushCommandQueue(machineId, server);
 
     server.addEventListener('message', async (event) => {
       try {
         const msg = JSON.parse(event.data);
-
-        // First message must be auth
-        if (!authenticated) {
-          clearTimeout(authTimeout);
-
-          if (msg.type !== 'auth') {
-            console.warn(`First message not auth for ${machineId}`);
-            server.close(4002, 'First message must be auth');
-            return;
-          }
-
-          if (msg.apiKey !== this.env.CCR_API_KEY) {
-            console.warn(`Invalid API key for ${machineId}`);
-            server.close(4003, 'Invalid API key');
-            return;
-          }
-
-          // Auth successful - close existing connection for same machineId if any
-          const existing = this.machines.get(machineId);
-          if (existing && existing !== server) {
-            console.log(`Closing existing connection for ${machineId}`);
-            existing.close(4000, 'Replaced by new connection');
-          }
-
-          // Now add to machines map
-          authenticated = true;
-          this.machines.set(machineId, server);
-          server.send(JSON.stringify({ type: 'authSuccess' }));
-          console.log(`Machine authenticated: ${machineId}`);
-
-          // Send queued commands
-          this.flushCommandQueue(machineId, server);
-          return;
-        }
-
-        // Authenticated - handle normal messages
         await this.handleMachineMessage(machineId, msg);
       } catch (err) {
         console.error('Error handling machine message:', err);
@@ -511,18 +508,14 @@ export class RouterDO {
     });
 
     server.addEventListener('close', () => {
-      clearTimeout(authTimeout);
       console.log(`Machine disconnected: ${machineId}`);
-      // Only delete if this is still the current connection for this machineId
       if (this.machines.get(machineId) === server) {
         this.machines.delete(machineId);
       }
     });
 
     server.addEventListener('error', (err) => {
-      clearTimeout(authTimeout);
       console.error(`WebSocket error for ${machineId}:`, err);
-      // Only delete if this is still the current connection for this machineId
       if (this.machines.get(machineId) === server) {
         this.machines.delete(machineId);
       }
@@ -530,7 +523,10 @@ export class RouterDO {
 
     return new Response(null, {
       status: 101,
-      webSocket: client
+      webSocket: client,
+      headers: {
+        'Sec-WebSocket-Protocol': 'ccr'
+      }
     });
   }
 
