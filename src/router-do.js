@@ -163,6 +163,9 @@ export class RouterDO {
       });
     }
 
+    // Touch session to prevent cleanup
+    this.touchSession(sessionId);
+
     // Generate token for this notification
     const token = this.generateToken();
 
@@ -219,6 +222,13 @@ export class RouterDO {
       .replace(/\+/g, '-')
       .replace(/\//g, '_')
       .replace(/=/g, '');
+  }
+
+  touchSession(sessionId) {
+    const now = Date.now();
+    this.sql.exec(`
+      UPDATE sessions SET updated_at = ? WHERE session_id = ?
+    `, now, sessionId);
   }
 
   verifyWebhookSecret(request) {
@@ -466,6 +476,9 @@ export class RouterDO {
       await this.sendTelegramMessage(chatId, '❌ Session not found');
       return new Response('ok', { status: 200 });
     }
+
+    // Touch session to prevent cleanup of active sessions
+    this.touchSession(sessionId);
 
     const machineId = session.machine_id;
 
