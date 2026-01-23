@@ -7,6 +7,11 @@ export class RouterDO {
 
     // WebSocket connections by machineId
     this.machines = new Map();
+
+    // Limits to prevent DoS
+    this.MAX_COMMAND_LENGTH = 10000;      // 10KB per command
+    this.MAX_QUEUE_PER_MACHINE = 100;     // Max queued commands per machine
+    this.MAX_SESSIONS = 1000;             // Max total sessions
   }
 
   async initialize() {
@@ -65,6 +70,24 @@ export class RouterDO {
         status: 400,
         headers: { 'Content-Type': 'application/json' }
       });
+    }
+
+    // Check session limit (only count if this is a new session)
+    const existing = this.sql.exec(
+      `SELECT 1 FROM sessions WHERE session_id = ?`, sessionId
+    ).toArray()[0];
+
+    if (!existing) {
+      const sessionCount = this.sql.exec(
+        `SELECT COUNT(*) as count FROM sessions`
+      ).toArray()[0].count;
+
+      if (sessionCount >= this.MAX_SESSIONS) {
+        return new Response(JSON.stringify({ error: 'Session limit reached' }), {
+          status: 429,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     }
 
     const now = Date.now();
@@ -400,6 +423,13 @@ export class RouterDO {
   }
 
   async routeCommandToMachine(sessionId, command, chatId) {
+    // Validate command length
+    if (command.length > this.MAX_COMMAND_LENGTH) {
+      await this.sendTelegramMessage(chatId,
+        `Command too long (${command.length} chars, max ${this.MAX_COMMAND_LENGTH})`);
+      return new Response('ok', { status: 200 });
+    }
+
     // Get machine for this session
     const session = this.sql.exec(`
       SELECT machine_id, label FROM sessions WHERE session_id = ?
@@ -425,6 +455,17 @@ export class RouterDO {
       }));
 
       console.log(`Command sent to ${machineId}: ${command.slice(0, 50)}`);
+      return new Response('ok', { status: 200 });
+    }
+
+    // Check queue size before adding
+    const queueSize = this.sql.exec(`
+      SELECT COUNT(*) as count FROM command_queue WHERE machine_id = ?
+    `, machineId).toArray()[0].count;
+
+    if (queueSize >= this.MAX_QUEUE_PER_MACHINE) {
+      await this.sendTelegramMessage(chatId,
+        `Queue full for ${session.label || machineId} (${queueSize} commands pending). Try again later.`);
       return new Response('ok', { status: 200 });
     }
 
