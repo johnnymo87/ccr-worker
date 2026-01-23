@@ -2,11 +2,9 @@
 export class RouterDO {
   constructor(state, env) {
     this.state = state;
+    this.ctx = state; // Alias for hibernation API
     this.env = env;
     this.sql = state.storage.sql;
-
-    // WebSocket connections by machineId
-    this.machines = new Map();
 
     // Promise-based init guard (safe against JS interleaving)
     this.initPromise = null;
@@ -15,6 +13,25 @@ export class RouterDO {
     this.MAX_COMMAND_LENGTH = 10000;      // 10KB per command
     this.MAX_QUEUE_PER_MACHINE = 100;     // Max queued commands per machine
     this.MAX_SESSIONS = 1000;             // Max total sessions
+  }
+
+  // Get connected machine WebSocket by ID
+  getMachineWebSocket(machineId) {
+    const sockets = this.ctx.getWebSockets(machineId);
+    return sockets.length > 0 ? sockets[0] : null;
+  }
+
+  // Get all connected machine IDs
+  getConnectedMachines() {
+    const allSockets = this.ctx.getWebSockets();
+    const machines = new Set();
+    for (const ws of allSockets) {
+      const attachment = ws.deserializeAttachment();
+      if (attachment?.machineId) {
+        machines.add(attachment.machineId);
+      }
+    }
+    return machines;
   }
 
   async ensureInitialized() {
@@ -439,6 +456,31 @@ export class RouterDO {
     return result === 0;
   }
 
+  // Verify API key from WebSocket subprotocol header
+  verifyApiKeyFromProtocols(protocols) {
+    const parts = protocols.split(',').map(p => p.trim());
+    if (parts[0] !== 'ccr' || parts.length < 2) {
+      return false;
+    }
+
+    const apiKey = parts[1];
+    const expected = this.env.CCR_API_KEY;
+
+    // Constant-time comparison
+    if (!expected || apiKey.length !== expected.length) {
+      return false;
+    }
+
+    const encoder = new TextEncoder();
+    const a = encoder.encode(apiKey);
+    const b = encoder.encode(expected);
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+      result |= a[i] ^ b[i];
+    }
+    return result === 0;
+  }
+
   async handleTelegramWebhook(request) {
     // Verify webhook secret
     if (!this.verifyWebhookSecret(request)) {
@@ -645,7 +687,7 @@ export class RouterDO {
     `, commandId, machineId, sessionId, command, String(chatId), now, now);
 
     // Try to send immediately if connected
-    const ws = this.machines.get(machineId);
+    const ws = this.getMachineWebSocket(machineId);
     if (ws && ws.readyState === 1) {
       this.sendCommand(ws, commandId, sessionId, command, chatId);
     } else {
@@ -692,103 +734,91 @@ export class RouterDO {
     return row ? row.attempts : 0;
   }
 
-  async handleWebSocket(request) {
+  async handleWebSocketUpgrade(request) {
     const url = new URL(request.url);
     const machineId = url.searchParams.get('machineId');
 
-    // Validate machineId format (alphanumeric + hyphens, max 64 chars)
+    // Validate machineId
     if (!machineId || typeof machineId !== 'string' ||
         machineId.length > 64 || !/^[a-zA-Z0-9-]+$/.test(machineId)) {
       return new Response('Invalid machine ID', { status: 400 });
     }
 
-    // Check auth via Sec-WebSocket-Protocol header
-    // Client sends: Sec-WebSocket-Protocol: ccr, <api-key>
+    // Auth via subprotocol
     const protocols = request.headers.get('Sec-WebSocket-Protocol');
-    if (!protocols) {
-      return new Response('Authentication required', { status: 401 });
+    if (!protocols || !this.verifyApiKeyFromProtocols(protocols)) {
+      return new Response('Unauthorized', { status: 401 });
     }
-
-    const parts = protocols.split(',').map(p => p.trim());
-    if (parts[0] !== 'ccr' || parts.length < 2) {
-      return new Response('Invalid protocol', { status: 401 });
-    }
-
-    const apiKey = parts[1];
-    const expected = this.env.CCR_API_KEY;
-
-    // Constant-time comparison
-    if (!expected || apiKey.length !== expected.length) {
-      return new Response('Invalid API key', { status: 401 });
-    }
-
-    const encoder = new TextEncoder();
-    const a = encoder.encode(apiKey);
-    const b = encoder.encode(expected);
-    let result = 0;
-    for (let i = 0; i < a.length; i++) {
-      result |= a[i] ^ b[i];
-    }
-    if (result !== 0) {
-      return new Response('Invalid API key', { status: 401 });
-    }
-
-    // Auth passed - accept WebSocket
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
 
     // Close existing connection for this machine
-    const existing = this.machines.get(machineId);
-    if (existing && existing !== server) {
+    const existing = this.getMachineWebSocket(machineId);
+    if (existing) {
       existing.close(4000, 'Replaced by new connection');
     }
 
-    this.machines.set(machineId, server);
-    server.accept();
+    // Accept with hibernation API
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
 
-    console.log(`Machine authenticated and connected: ${machineId}`);
+    // Accept and attach machineId (survives hibernation)
+    this.ctx.acceptWebSocket(server, [machineId]);
+    server.serializeAttachment({ machineId });
 
-    // Flush queued commands (fire-and-forget, catch errors)
+    console.log(`Machine ${machineId} connected`);
+
+    // Flush queued commands (fire-and-forget to not block upgrade response)
     this.flushCommandQueue(machineId, server).catch(err => {
       console.error(`Failed to flush queue for ${machineId}:`, err.message);
-    });
-
-    server.addEventListener('message', async (event) => {
-      // Reject oversized messages
-      if (event.data.length > 65536) { // 64KB limit
-        console.warn(`Oversized message from ${machineId}: ${event.data.length} bytes`);
-        return;
-      }
-
-      try {
-        const msg = JSON.parse(event.data);
-        await this.handleMachineMessage(machineId, msg);
-      } catch (err) {
-        console.error(`Error handling message from ${machineId}:`, err.message);
-      }
-    });
-
-    server.addEventListener('close', () => {
-      console.log(`Machine disconnected: ${machineId}`);
-      if (this.machines.get(machineId) === server) {
-        this.machines.delete(machineId);
-      }
-    });
-
-    server.addEventListener('error', (err) => {
-      console.error(`WebSocket error for ${machineId}:`, err);
-      if (this.machines.get(machineId) === server) {
-        this.machines.delete(machineId);
-      }
     });
 
     return new Response(null, {
       status: 101,
       webSocket: client,
-      headers: {
-        'Sec-WebSocket-Protocol': 'ccr'
-      }
+      headers: { 'Sec-WebSocket-Protocol': 'ccr' }
     });
+  }
+
+  // Called by runtime when WebSocket receives message (hibernation API)
+  async webSocketMessage(ws, message) {
+    await this.ensureInitialized();
+
+    // Size limit (handle both string and ArrayBuffer)
+    const size = typeof message === 'string' ? message.length : message.byteLength;
+    if (size > 65536) {
+      console.warn('Oversized WebSocket message rejected');
+      return;
+    }
+
+    const attachment = ws.deserializeAttachment();
+    const machineId = attachment?.machineId;
+
+    if (!machineId) {
+      console.warn('WebSocket message from unknown machine');
+      return;
+    }
+
+    try {
+      const msg = JSON.parse(message);
+      await this.handleMachineMessage(machineId, msg, ws);
+    } catch (err) {
+      console.error(`Error handling message from ${machineId}:`, err.message);
+    }
+  }
+
+  // Called by runtime when WebSocket closes
+  async webSocketClose(ws, code, reason, _wasClean) {
+    await this.ensureInitialized();
+    const attachment = ws.deserializeAttachment();
+    const machineId = attachment?.machineId;
+    console.log(`Machine ${machineId || 'unknown'} disconnected: ${code} ${reason}`);
+  }
+
+  // Called by runtime when WebSocket errors
+  async webSocketError(ws, error) {
+    await this.ensureInitialized();
+    const attachment = ws.deserializeAttachment();
+    const machineId = attachment?.machineId;
+    console.error(`WebSocket error for ${machineId || 'unknown'}:`, error.message);
   }
 
   async flushCommandQueue(machineId, ws) {
@@ -815,7 +845,7 @@ export class RouterDO {
     }
   }
 
-  async handleMachineMessage(machineId, msg) {
+  async handleMachineMessage(machineId, msg, ws) {
     // Schema validation
     if (typeof msg !== 'object' || msg === null) {
       console.warn(`Invalid message from ${machineId}: not an object`);
@@ -829,8 +859,7 @@ export class RouterDO {
     }
 
     if (msg.type === 'ping') {
-      const ws = this.machines.get(machineId);
-      if (ws) ws.send(JSON.stringify({ type: 'pong' }));
+      ws.send(JSON.stringify({ type: 'pong' }));
       return;
     }
 
@@ -929,7 +958,7 @@ export class RouterDO {
     try {
       // WebSocket upgrade for machine agents
       if (path === '/ws' && request.headers.get('Upgrade') === 'websocket') {
-        return this.handleWebSocket(request);
+        return this.handleWebSocketUpgrade(request);
       }
 
       // Session management
