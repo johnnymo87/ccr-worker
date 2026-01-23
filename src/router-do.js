@@ -904,6 +904,40 @@ export class RouterDO {
     }
   }
 
+  async retrySentCommands() {
+    const RETRY_AFTER_MS = 60000; // Retry sent commands not acked after 1 minute
+    const MAX_ATTEMPTS = 10;
+    const cutoff = Date.now() - RETRY_AFTER_MS;
+
+    // Find sent commands that haven't been acked and are past retry window
+    const stale = this.sql.exec(`
+      SELECT command_id, machine_id, session_id, command, chat_id, attempts
+      FROM command_queue
+      WHERE status = 'sent'
+        AND sent_at < ?
+        AND attempts < ?
+        AND (next_retry_at IS NULL OR next_retry_at <= ?)
+      LIMIT 50
+    `, cutoff, MAX_ATTEMPTS, Date.now()).toArray();
+
+    if (stale.length === 0) return;
+
+    console.log(`Retrying ${stale.length} stale sent commands`);
+
+    for (const cmd of stale) {
+      const ws = this.getMachineWebSocket(cmd.machine_id);
+      if (ws && ws.readyState === 1) {
+        this.sendCommand(ws, cmd.command_id, cmd.session_id, cmd.command, cmd.chat_id);
+      } else {
+        // Machine offline, mark for next retry with backoff
+        const backoffMs = Math.min(1000 * Math.pow(2, cmd.attempts), 300000);
+        this.sql.exec(`
+          UPDATE command_queue SET next_retry_at = ? WHERE command_id = ?
+        `, Date.now() + backoffMs, cmd.command_id);
+      }
+    }
+  }
+
   async cleanup() {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const oneHourAgo = Date.now() - 60 * 60 * 1000;
@@ -941,8 +975,9 @@ export class RouterDO {
   async alarm() {
     await this.ensureInitialized();
 
-    console.log('Alarm triggered - running cleanup');
+    console.log('Alarm triggered - running cleanup and retry');
     await this.cleanup();
+    await this.retrySentCommands();
 
     // Schedule next alarm
     await this.state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
