@@ -823,9 +823,22 @@ export class RouterDO {
 
   async flushCommandQueue(machineId, ws) {
     const BATCH_SIZE = 10;
+    const MAX_INFLIGHT = 20;
     const now = Date.now();
 
-    // Get pending/sent commands ready for (re)send, respecting backoff
+    // Count inflight (sent but not acked)
+    const inflight = this.sql.exec(`
+      SELECT COUNT(*) as count FROM command_queue
+      WHERE machine_id = ? AND status = 'sent'
+    `, machineId).toArray()[0].count;
+
+    if (inflight >= MAX_INFLIGHT) {
+      console.log(`Inflight cap reached for ${machineId} (${inflight}/${MAX_INFLIGHT})`);
+      return;
+    }
+
+    const toSend = Math.min(BATCH_SIZE, MAX_INFLIGHT - inflight);
+
     const commands = this.sql.exec(`
       SELECT command_id, session_id, command, chat_id
       FROM command_queue
@@ -834,11 +847,11 @@ export class RouterDO {
         AND (next_retry_at IS NULL OR next_retry_at <= ?)
       ORDER BY created_at ASC
       LIMIT ?
-    `, machineId, now, BATCH_SIZE).toArray();
+    `, machineId, now, toSend).toArray();
 
     if (commands.length === 0) return;
 
-    console.log(`Flushing ${commands.length} commands to ${machineId} (batch of ${BATCH_SIZE})`);
+    console.log(`Flushing ${commands.length} commands to ${machineId} (batch of ${toSend}, inflight: ${inflight})`);
 
     for (const cmd of commands) {
       this.sendCommand(ws, cmd.command_id, cmd.session_id, cmd.command, cmd.chat_id);
@@ -873,6 +886,10 @@ export class RouterDO {
         `, Date.now(), commandId, machineId);
         if (result.rowsWritten > 0) {
           console.log(`Command ${commandId} acked by ${machineId}`);
+          // Flush more commands if any pending
+          this.flushCommandQueue(machineId, ws).catch(err => {
+            console.error(`Flush after ack failed: ${err.message}`);
+          });
         }
       }
       return;
