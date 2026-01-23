@@ -56,6 +56,22 @@ export class RouterDO {
   }
 
   async _runSchemaSetup() {
+    // Clean up any partial migration artifacts from crashed migrations
+    const artifactTables = ['messages_new', 'command_queue_new'];
+    for (const table of artifactTables) {
+      try {
+        const exists = this.sql.exec(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`, table).toArray();
+        if (exists.length > 0) {
+          console.warn(`Cleaning up migration artifact: ${table}`);
+          // Safe: table names come from hardcoded artifactTables array, not user input.
+          // SQLite DDL (DROP TABLE) doesn't support parameterized table names, so string interpolation is required.
+          this.sql.exec(`DROP TABLE IF EXISTS ${table}`);
+        }
+      } catch (e) {
+        // Ignore errors checking for artifacts
+      }
+    }
+
     // Sessions: which machine owns which session
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
