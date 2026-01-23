@@ -360,7 +360,20 @@ export class RouterDO {
 
   verifyWebhookSecret(request) {
     const secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
-    return secret === this.env.TELEGRAM_WEBHOOK_SECRET;
+    const expected = this.env.TELEGRAM_WEBHOOK_SECRET;
+
+    if (!secret || !expected) return false;
+    if (secret.length !== expected.length) return false;
+
+    // Constant-time comparison (same pattern as API key)
+    const encoder = new TextEncoder();
+    const a = encoder.encode(secret);
+    const b = encoder.encode(expected);
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+      result |= a[i] ^ b[i];
+    }
+    return result === 0;
   }
 
   isAllowedTelegramSource(chatId, userId) {
@@ -530,11 +543,15 @@ export class RouterDO {
   }
 
   async handleTelegramCallback(callbackQuery) {
-    const chatId = callbackQuery.message?.chat.id;
-    const messageId = callbackQuery.message?.message_id;
-    const data = callbackQuery.data; // e.g., "cmd:TOKEN:continue"
+    const chatId = callbackQuery.message?.chat?.id;
+    const data = callbackQuery.data;
 
-    // Parse callback data
+    // Guard: data can be undefined for some callback types
+    if (typeof data !== 'string') {
+      return new Response('ok', { status: 200 });
+    }
+
+    // Parse callback data (e.g., "cmd:TOKEN:continue")
     const parts = data.split(':');
     if (parts[0] !== 'cmd' || parts.length < 3) {
       return new Response('ok', { status: 200 });
@@ -679,8 +696,10 @@ export class RouterDO {
     const url = new URL(request.url);
     const machineId = url.searchParams.get('machineId');
 
-    if (!machineId) {
-      return new Response('machineId required', { status: 400 });
+    // Validate machineId format (alphanumeric + hyphens, max 64 chars)
+    if (!machineId || typeof machineId !== 'string' ||
+        machineId.length > 64 || !/^[a-zA-Z0-9-]+$/.test(machineId)) {
+      return new Response('Invalid machine ID', { status: 400 });
     }
 
     // Check auth via Sec-WebSocket-Protocol header
@@ -735,11 +754,17 @@ export class RouterDO {
     });
 
     server.addEventListener('message', async (event) => {
+      // Reject oversized messages
+      if (event.data.length > 65536) { // 64KB limit
+        console.warn(`Oversized message from ${machineId}: ${event.data.length} bytes`);
+        return;
+      }
+
       try {
         const msg = JSON.parse(event.data);
         await this.handleMachineMessage(machineId, msg);
       } catch (err) {
-        console.error('Error handling machine message:', err);
+        console.error(`Error handling message from ${machineId}:`, err.message);
       }
     });
 
@@ -791,6 +816,18 @@ export class RouterDO {
   }
 
   async handleMachineMessage(machineId, msg) {
+    // Schema validation
+    if (typeof msg !== 'object' || msg === null) {
+      console.warn(`Invalid message from ${machineId}: not an object`);
+      return;
+    }
+
+    const validTypes = ['ping', 'ack', 'commandResult'];
+    if (!validTypes.includes(msg.type)) {
+      console.warn(`Invalid message type from ${machineId}: ${msg.type}`);
+      return;
+    }
+
     if (msg.type === 'ping') {
       const ws = this.machines.get(machineId);
       if (ws) ws.send(JSON.stringify({ type: 'pong' }));
