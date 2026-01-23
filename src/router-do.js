@@ -50,6 +50,14 @@ export class RouterDO {
       )
     `);
 
+    // Seen updates: deduplicate Telegram webhook retries
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS seen_updates (
+        update_id INTEGER PRIMARY KEY,
+        created_at INTEGER NOT NULL
+      )
+    `);
+
     // Indexes
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_sessions_machine ON sessions(machine_id)
@@ -59,6 +67,9 @@ export class RouterDO {
     `);
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_seen_updates_created ON seen_updates(created_at)
     `);
   }
 
@@ -286,6 +297,22 @@ export class RouterDO {
     }
 
     const update = await request.json();
+
+    // Atomic deduplication: try to insert, check if it existed
+    const updateId = update.update_id;
+    if (updateId) {
+      const insertResult = this.sql.exec(
+        `INSERT OR IGNORE INTO seen_updates (update_id, created_at) VALUES (?, ?)`,
+        updateId, Date.now()
+      );
+
+      // If rowsWritten is 0, the row already existed (duplicate)
+      if (insertResult.rowsWritten === 0) {
+        console.log(`Duplicate update ${updateId} ignored`);
+        return new Response('ok', { status: 200 });
+      }
+    }
+
     console.log('Webhook received:', JSON.stringify(update).slice(0, 200));
 
     // Extract chatId and userId for allowlist check
@@ -650,7 +677,13 @@ export class RouterDO {
       DELETE FROM sessions WHERE updated_at < ?
     `, oneDayAgo);
 
-    console.log(`Cleanup: ${msgResult.changes} messages, ${queueResult.changes} queued, ${sessionResult.changes} sessions`);
+    // Clean old seen updates (keep 1 hour worth)
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    const seenResult = this.sql.exec(`
+      DELETE FROM seen_updates WHERE created_at < ?
+    `, oneHourAgo);
+
+    console.log(`Cleanup: ${msgResult.changes} messages, ${queueResult.changes} queued, ${sessionResult.changes} sessions, ${seenResult.changes} seen_updates`);
   }
 
   async fetch(request) {
