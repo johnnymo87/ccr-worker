@@ -8,13 +8,37 @@ export class RouterDO {
     // WebSocket connections by machineId
     this.machines = new Map();
 
+    // Promise-based init guard (safe against JS interleaving)
+    this.initPromise = null;
+
     // Limits to prevent DoS
     this.MAX_COMMAND_LENGTH = 10000;      // 10KB per command
     this.MAX_QUEUE_PER_MACHINE = 100;     // Max queued commands per machine
     this.MAX_SESSIONS = 1000;             // Max total sessions
   }
 
-  async initialize() {
+  async ensureInitialized() {
+    if (!this.initPromise) {
+      this.initPromise = this._initializeOnce();
+    }
+    return this.initPromise;
+  }
+
+  async _initializeOnce() {
+    // Use blockConcurrencyWhile for schema operations
+    await this.state.blockConcurrencyWhile(async () => {
+      await this._runSchemaSetup();
+
+      // Schedule cleanup alarm if not already set
+      const currentAlarm = await this.state.storage.getAlarm();
+      if (!currentAlarm) {
+        await this.state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+        console.log('Cleanup alarm scheduled');
+      }
+    });
+  }
+
+  async _runSchemaSetup() {
     // Sessions: which machine owns which session
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
@@ -831,8 +855,18 @@ export class RouterDO {
     console.log(`Cleanup: ${msgCursor.rowsWritten} messages, ${sessionCursor.rowsWritten} sessions, ${seenCursor.rowsWritten} seen_updates`);
   }
 
+  async alarm() {
+    await this.ensureInitialized();
+
+    console.log('Alarm triggered - running cleanup');
+    await this.cleanup();
+
+    // Schedule next alarm
+    await this.state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+  }
+
   async fetch(request) {
-    await this.initialize();
+    await this.ensureInitialized();
 
     const url = new URL(request.url);
     const path = url.pathname;
