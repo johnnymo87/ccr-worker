@@ -158,6 +158,16 @@ export class RouterDO {
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_seen_updates_created ON seen_updates(created_at)
     `);
+
+    // Composite index for token+chat_id lookups (most common query pattern)
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_token_chat ON messages(token, chat_id)
+    `);
+
+    // Index for command queue status queries
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_queue_machine_status ON command_queue(machine_id, status)
+    `);
   }
 
   async handleRegisterSession(body) {
