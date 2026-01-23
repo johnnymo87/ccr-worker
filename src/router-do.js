@@ -703,6 +703,7 @@ export class RouterDO {
   sendCommand(ws, commandId, sessionId, command, chatId) {
     const currentAttempts = this.getAttempts(commandId);
     const newAttempts = currentAttempts + 1;
+    const RETRY_INTERVAL_MS = 60000; // Retry after 60s if not acked
 
     try {
       ws.send(JSON.stringify({
@@ -712,12 +713,12 @@ export class RouterDO {
         command,
         chatId: String(chatId)
       }));
-      // Mark as sent, increment attempts
+      // Mark as sent, set retry time for if not acked
       this.sql.exec(`
         UPDATE command_queue
-        SET status = 'sent', sent_at = ?, attempts = ?
+        SET status = 'sent', sent_at = ?, attempts = ?, next_retry_at = ?
         WHERE command_id = ?
-      `, Date.now(), newAttempts, commandId);
+      `, Date.now(), newAttempts, Date.now() + RETRY_INTERVAL_MS, commandId);
       console.log(`Command ${commandId} sent (attempt ${newAttempts})`);
     } catch (err) {
       // Mark retry with exponential backoff
