@@ -26,17 +26,52 @@ export class RouterDO {
       )
     `);
 
-    // Messages: map Telegram message_id to session for reply routing
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS messages (
-        chat_id INTEGER NOT NULL,
-        message_id INTEGER NOT NULL,
-        session_id TEXT NOT NULL,
-        token TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY (chat_id, message_id)
-      )
-    `);
+    // Messages table migration: convert chat_id to TEXT for 64-bit precision
+    const hasOldMessagesSchema = (() => {
+      try {
+        const cols = this.sql.exec(`PRAGMA table_info(messages)`).toArray();
+        // Check if chat_id column type contains INT (old schema)
+        // SQLite doesn't enforce types strictly, but we can check declared type
+        const chatIdCol = cols.find(c => c.name === 'chat_id');
+        // If table doesn't exist or chat_id not found, needs fresh creation
+        return chatIdCol && chatIdCol.type.toUpperCase().includes('INT');
+      } catch {
+        return false;
+      }
+    })();
+
+    if (hasOldMessagesSchema) {
+      console.log('Migrating messages table for TEXT chat_id...');
+      this.sql.exec(`
+        CREATE TABLE messages_new (
+          chat_id TEXT NOT NULL,
+          message_id INTEGER NOT NULL,
+          session_id TEXT NOT NULL,
+          token TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (chat_id, message_id)
+        )
+      `);
+      this.sql.exec(`
+        INSERT INTO messages_new
+        SELECT CAST(chat_id AS TEXT), message_id, session_id, token, created_at
+        FROM messages
+      `);
+      this.sql.exec(`DROP TABLE messages`);
+      this.sql.exec(`ALTER TABLE messages_new RENAME TO messages`);
+      console.log('Messages migration complete');
+    } else {
+      this.sql.exec(`
+        CREATE TABLE IF NOT EXISTS messages (
+          chat_id TEXT NOT NULL,
+          message_id INTEGER NOT NULL,
+          session_id TEXT NOT NULL,
+          token TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (chat_id, message_id)
+        )
+      `);
+    }
 
     // Command queue migration: convert to command_id as PK with proper schema
     const hasOldSchema = (() => {
@@ -253,7 +288,7 @@ export class RouterDO {
     this.sql.exec(`
       INSERT INTO messages (chat_id, message_id, session_id, token, created_at)
       VALUES (?, ?, ?, ?, ?)
-    `, chatId, messageId, sessionId, token, now);
+    `, String(chatId), messageId, sessionId, token, now);
 
     console.log(`Notification sent: msg ${messageId} → session ${sessionId}`);
 
@@ -420,7 +455,7 @@ export class RouterDO {
       const mapping = this.sql.exec(`
         SELECT session_id, token FROM messages
         WHERE chat_id = ? AND message_id = ?
-      `, chatId, replyToMessage.message_id).toArray()[0];
+      `, String(chatId), replyToMessage.message_id).toArray()[0];
 
       if (mapping) {
         sessionId = mapping.session_id;
@@ -436,7 +471,7 @@ export class RouterDO {
         // Look up session by token (must match chat_id to prevent cross-chat replay)
         const mapping = this.sql.exec(`
           SELECT session_id FROM messages WHERE token = ? AND chat_id = ?
-        `, token, chatId).toArray()[0];
+        `, token, String(chatId)).toArray()[0];
         if (mapping) {
           sessionId = mapping.session_id;
         }
@@ -477,7 +512,7 @@ export class RouterDO {
     // Look up session (must match chat_id to prevent cross-chat replay)
     const mapping = this.sql.exec(`
       SELECT session_id FROM messages WHERE token = ? AND chat_id = ?
-    `, token, chatId).toArray()[0];
+    `, token, String(chatId)).toArray()[0];
 
     if (!mapping) {
       await this.answerCallbackQuery(callbackQuery.id, 'Session expired');
