@@ -301,6 +301,15 @@ export class RouterDO {
       });
     }
 
+    // Validate chatId against allowlist (same as inbound)
+    if (!this.isAllowedChatId(chatId)) {
+      console.warn(`Outbound notification blocked: chatId ${chatId} not in allowlist`);
+      return new Response(JSON.stringify({ error: 'Chat ID not allowed' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     // Touch session to prevent cleanup
     this.touchSession(sessionId);
 
@@ -393,32 +402,25 @@ export class RouterDO {
     return result === 0;
   }
 
-  isAllowedTelegramSource(chatId, userId) {
-    // Parse ALLOWED_CHAT_IDS
+  isAllowedChatId(chatId) {
     const allowedChatsRaw = this.env.ALLOWED_CHAT_IDS || '';
-    const allowedChats = allowedChatsRaw
-      .split(',')
-      .map(id => id.trim())
-      .filter(id => id.length > 0);
+    const allowedChats = allowedChatsRaw.split(',').map(id => id.trim()).filter(id => id.length > 0);
 
-    // Fail closed: if no allowed chats configured, deny all
     if (allowedChats.length === 0) {
-      console.warn('ALLOWED_CHAT_IDS not configured - denying all Telegram requests');
       return false;
     }
 
-    // Check if chatId is allowed
-    const chatIdStr = String(chatId);
-    if (!allowedChats.includes(chatIdStr)) {
+    return allowedChats.includes(String(chatId));
+  }
+
+  isAllowedTelegramSource(chatId, userId) {
+    if (!this.isAllowedChatId(chatId)) {
       return false;
     }
 
-    // If ALLOWED_USER_IDS is configured, also check userId
+    // User ID check (if configured)
     const allowedUsersRaw = this.env.ALLOWED_USER_IDS || '';
-    const allowedUsers = allowedUsersRaw
-      .split(',')
-      .map(id => id.trim())
-      .filter(id => id.length > 0);
+    const allowedUsers = allowedUsersRaw.split(',').map(id => id.trim()).filter(id => id.length > 0);
 
     if (allowedUsers.length > 0) {
       const userIdStr = String(userId);
