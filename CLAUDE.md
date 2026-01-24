@@ -42,6 +42,7 @@ wrangler deploy
 
 | Skill | Description |
 |-------|-------------|
+| [Architecture](.claude/skills/architecture/SKILL.md) | Worker internals, Durable Object, message flow |
 | [Deployment](.claude/skills/deployment/SKILL.md) | Deploy and update the Worker |
 | [Troubleshooting](.claude/skills/troubleshooting/SKILL.md) | Debug common issues |
 
