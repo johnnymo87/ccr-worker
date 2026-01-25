@@ -49,4 +49,4 @@ wrangler deploy
 ## Related
 
 - [claude-code-remote](https://github.com/johnnymo87/claude-code-remote) - The notification relay system
-- Worker deployed at: `https://ccr-router.jonathan-mohrbacher.workers.dev`
+- Deploy your own Worker with: `wrangler deploy`

@@ -9,7 +9,7 @@ description: Use when deploying or updating the CCR Worker to Cloudflare
 
 - Cloudflare account with Workers enabled
 - `wrangler` CLI installed
-- Access to `CLOUDFLARE_API_TOKEN` secret
+- Access to `CLOUDFLARE_API_TOKEN` secret (from sops-nix on devbox)
 
 ## Authentication
 
@@ -19,20 +19,18 @@ export CLOUDFLARE_API_TOKEN="$(cat /run/secrets/cloudflare_api_token)"
 
 ## Setting Secrets
 
-**IMPORTANT:** Always use file input to avoid shell escaping issues.
+Secrets should be piped directly from sops-nix to avoid shell escaping issues.
 
 ```bash
 cd ~/projects/ccr-worker
 
-# Bot token
-grep -o 'TELEGRAM_BOT_TOKEN=.*' ~/projects/claude-code-remote/.env | cut -d= -f2 > /tmp/token.txt
-wrangler secret put TELEGRAM_BOT_TOKEN < /tmp/token.txt
-rm /tmp/token.txt
+# From sops-nix (devbox)
+cat /run/secrets/telegram_bot_token | wrangler secret put TELEGRAM_BOT_TOKEN
+cat /run/secrets/telegram_webhook_secret | wrangler secret put TELEGRAM_WEBHOOK_SECRET
+cat /run/secrets/ccr_api_key | wrangler secret put CCR_API_KEY
 
-# Webhook secret
-grep -o 'TELEGRAM_WEBHOOK_SECRET=.*' ~/projects/claude-code-remote/.env | cut -d= -f2 > /tmp/secret.txt
-wrangler secret put TELEGRAM_WEBHOOK_SECRET < /tmp/secret.txt
-rm /tmp/secret.txt
+# Verify
+wrangler secret list
 ```
 
 ## Deploy
@@ -46,19 +44,61 @@ wrangler deploy
 After first deployment, point Telegram to the Worker:
 
 ```bash
-source ~/projects/claude-code-remote/.env
-curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+# Read secrets from sops-nix
+BOT_TOKEN="$(cat /run/secrets/telegram_bot_token)"
+WEBHOOK_SECRET="$(cat /run/secrets/telegram_webhook_secret)"
+PATH_SECRET="$(cat /run/secrets/telegram_webhook_path_secret)"
+WORKER_URL="https://ccr-router.your-account.workers.dev"  # Replace with your Worker URL
+
+curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
   -H "Content-Type: application/json" \
-  -d "{\"url\": \"https://ccr-router.jonathan-mohrbacher.workers.dev/webhook/telegram/$TELEGRAM_WEBHOOK_SECRET\"}"
+  -d "{
+    \"url\": \"${WORKER_URL}/webhook/telegram/${PATH_SECRET}\",
+    \"secret_token\": \"${WEBHOOK_SECRET}\"
+  }"
 ```
 
 ## Verify Deployment
 
 ```bash
-# Health check
-curl https://ccr-router.jonathan-mohrbacher.workers.dev/health
+# Health check (replace with your Worker URL)
+curl https://ccr-router.your-account.workers.dev/health
 # Should return: ok
 
 # Check registered sessions
-curl https://ccr-router.jonathan-mohrbacher.workers.dev/sessions | jq
+curl https://ccr-router.your-account.workers.dev/sessions | jq
 ```
+
+## Rollback
+
+If deployment breaks functionality:
+
+```bash
+# View deployment history
+wrangler deployments list
+
+# Roll back to previous version
+wrangler rollback
+```
+
+## Troubleshooting Deployment
+
+### "Could not route to /health"
+
+Durable Object binding not configured. Check `wrangler.toml` has:
+```toml
+[[durable_objects.bindings]]
+name = "ROUTER"
+class_name = "RouterDurableObject"
+```
+
+### Secrets not updating
+
+Secrets may take 30-60 seconds to propagate. Wait and test again.
+
+### API token issues
+
+Verify token has correct permissions:
+- Workers Scripts: Edit
+- Workers KV Storage: Edit (if using KV)
+- D1: Edit (if using D1)

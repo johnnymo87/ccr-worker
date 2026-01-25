@@ -14,42 +14,46 @@ Worker secrets may be corrupted from shell escaping when set via `echo | wrangle
 | 404 | Bot token invalid |
 | 401 Unauthorized | Webhook secret mismatch |
 
-**Fix:** Re-set secrets using file input:
+**Fix:** Re-set secrets by piping directly from sops-nix:
 
 ```bash
 cd ~/projects/ccr-worker
 export CLOUDFLARE_API_TOKEN="$(cat /run/secrets/cloudflare_api_token)"
 
 # Bot token (fixes 404)
-grep -o 'TELEGRAM_BOT_TOKEN=.*' ~/projects/claude-code-remote/.env | cut -d= -f2 > /tmp/secret.txt
-wrangler secret put TELEGRAM_BOT_TOKEN < /tmp/secret.txt
-rm /tmp/secret.txt
+cat /run/secrets/telegram_bot_token | wrangler secret put TELEGRAM_BOT_TOKEN
 
 # Webhook secret (fixes 401)
-grep -o 'TELEGRAM_WEBHOOK_SECRET=.*' ~/projects/claude-code-remote/.env | cut -d= -f2 > /tmp/secret.txt
-wrangler secret put TELEGRAM_WEBHOOK_SECRET < /tmp/secret.txt
-rm /tmp/secret.txt
+cat /run/secrets/telegram_webhook_secret | wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
 **Verify:**
 
 ```bash
-source ~/projects/claude-code-remote/.env
-curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo" | jq '{url, last_error_message}'
+curl -s "https://api.telegram.org/bot$(cat /run/secrets/telegram_bot_token)/getWebhookInfo" | jq '{url, last_error_message}'
 ```
 
 ## Check Worker Status
 
+Replace `your-account` with your Cloudflare account subdomain:
+
 ```bash
 # Health check
-curl https://ccr-router.jonathan-mohrbacher.workers.dev/health
+curl https://ccr-router.your-account.workers.dev/health
 
 # View registered sessions
-curl https://ccr-router.jonathan-mohrbacher.workers.dev/sessions | jq
+curl https://ccr-router.your-account.workers.dev/sessions | jq
 ```
 
 ## View Worker Logs
 
+**Via CLI:**
+```bash
+export CLOUDFLARE_API_TOKEN="$(cat /run/secrets/cloudflare_api_token)"
+wrangler tail --format=pretty
+```
+
+**Via Dashboard:**
 1. Go to Cloudflare Dashboard → Workers & Pages
 2. Select `ccr-router`
 3. Click "Logs" tab
@@ -58,18 +62,21 @@ curl https://ccr-router.jonathan-mohrbacher.workers.dev/sessions | jq
 ## Test Notification Flow
 
 ```bash
+WORKER_URL="https://ccr-router.your-account.workers.dev"  # Replace with your URL
+CHAT_ID="your-chat-id"  # Replace with your Telegram chat ID
+
 # Register test session
-curl -X POST https://ccr-router.jonathan-mohrbacher.workers.dev/sessions/register \
+curl -X POST "${WORKER_URL}/sessions/register" \
   -H 'Content-Type: application/json' \
   -d '{"sessionId":"test","machineId":"devbox","label":"test"}'
 
-# Send notification (replace YOUR_CHAT_ID)
-curl -X POST https://ccr-router.jonathan-mohrbacher.workers.dev/notifications/send \
+# Send notification
+curl -X POST "${WORKER_URL}/notifications/send" \
   -H 'Content-Type: application/json' \
-  -d '{"sessionId":"test","chatId":YOUR_CHAT_ID,"text":"Test message"}'
+  -d "{\"sessionId\":\"test\",\"chatId\":${CHAT_ID},\"text\":\"Test message\"}"
 
 # Clean up
-curl -X POST https://ccr-router.jonathan-mohrbacher.workers.dev/sessions/unregister \
+curl -X POST "${WORKER_URL}/sessions/unregister" \
   -H 'Content-Type: application/json' \
   -d '{"sessionId":"test"}'
 ```
@@ -79,23 +86,47 @@ curl -X POST https://ccr-router.jonathan-mohrbacher.workers.dev/sessions/unregis
 Check CCR logs for connection status:
 
 ```bash
-npm run webhooks:log
-# Look for: [MachineAgent] [INFO] Connected to Worker as <machine-id>
+# Devbox
+devenv shell
+ccr-start npm run webhooks:log
+
+# macOS
+devenv shell
+secretspec run -- npm run webhooks:log
+
+# Look for: [MachineAgent] [INFO] Authenticated and connected as <machine-id>
 ```
 
 If not connecting:
-1. Verify `CCR_WORKER_URL` in CCR `.env`
+1. Verify `CCR_WORKER_URL` in secretspec.toml or secret storage
 2. Verify `CCR_MACHINE_ID` is set and unique per machine
-3. Check Worker is deployed: `curl .../health`
+3. Verify `CCR_API_KEY` matches between agent and Worker
+4. Check Worker is deployed: `curl .../health`
 
 ## Commands Going to Wrong Machine
 
 Each machine needs unique `CCR_MACHINE_ID`:
+- **Devbox**: Hardcoded in `ccr-start` script (set to "devbox")
+- **macOS**: Stored in Keychain via SecretSpec
 
+Check current sessions:
 ```bash
-# devbox .env
-CCR_MACHINE_ID=devbox
-
-# macOS .env
-CCR_MACHINE_ID=macbook
+curl https://ccr-router.your-account.workers.dev/sessions | jq
 ```
+
+## WebSocket Connection Drops
+
+Durable Objects hibernate after ~60s of inactivity. This is normal - MachineAgent auto-reconnects:
+
+```
+[MachineAgent] [WARN] WebSocket closed (1006: ), reconnecting...
+[MachineAgent] [INFO] Authenticated and connected as devbox
+```
+
+## Durable Object Errors
+
+If seeing "Durable Object not found" or similar:
+
+1. Check wrangler.toml has correct bindings
+2. Redeploy: `wrangler deploy`
+3. If persists, check Cloudflare Dashboard for DO errors
